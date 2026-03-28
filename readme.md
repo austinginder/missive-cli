@@ -12,10 +12,10 @@ Designed to work alongside AI coding assistants like [Claude Code](https://docs.
 
 ## Installation
 
-1. Copy the plugin to your WordPress plugins directory:
+1. Install and activate:
 
-```
-wp-content/plugins/missive-cli/
+```bash
+wp plugin install https://github.com/austinginder/missive-cli/releases/latest/download/missive-cli.zip --activate
 ```
 
 2. Add your API key to `wp-config.php`:
@@ -26,13 +26,7 @@ define( 'MISSIVE_TEAM_ID', 'optional-team-id' );    // enables team inbox sync
 define( 'MISSIVE_API_NAME', 'Your Name' );           // display name for close actions
 ```
 
-3. Activate the plugin:
-
-```bash
-wp plugin activate missive-cli
-```
-
-4. Run your initial sync:
+3. Run your initial sync:
 
 ```bash
 # Sync the last week (default)
