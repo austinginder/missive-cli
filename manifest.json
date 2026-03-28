@@ -1,0 +1,22 @@
+{
+    "name": "Missive CLI",
+    "slug": "missive-cli",
+    "author": "<a href=\"https://github.com/austinginder\">Austin Ginder</a>",
+    "author_profile": "https://profiles.wordpress.org/austinginder",
+    "donate_link": "https://github.com/sponsors/austinginder",
+    "version": "1.0.0",
+    "download_url": "https://github.com/austinginder/missive-cli/releases/download/v1.0.0/missive-cli.zip",
+    "requires": "5.6",
+    "tested": "6.9",
+    "requires_php": "8.0",
+    "added": "2026-03-28 00:00:00",
+    "last_updated": "2026-03-28 00:00:00",
+    "homepage": "https://github.com/austinginder/missive-cli/",
+    "sections": {
+        "description": "WP-CLI commands for syncing and managing Missive inbox conversations. Syncs your Missive inbox to a local SQLite database for fast offline search, email drafting, and bulk operations."
+    },
+    "banners": {
+        "low": "",
+        "high": ""
+    }
+}
