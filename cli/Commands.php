@@ -94,6 +94,9 @@ class Commands {
      * [--force]
      * : Re-fetch all message bodies even if unchanged
      *
+     * [--start-before=<datetime>]
+     * : Start syncing from this point instead of now (e.g., 2025-01-15, "2025-01-15 08:00:00")
+     *
      * ## EXAMPLES
      *
      *     wp missive sync
@@ -101,6 +104,7 @@ class Commands {
      *     wp missive sync --timeframe=7d --full
      *     wp missive sync --timeframe=12h --force
      *     wp missive sync --all-open
+     *     wp missive sync --timeframe=10y --start-before="2024-06-01"
      *
      * @when after_wp_load
      */
@@ -109,6 +113,18 @@ class Commands {
         $force    = isset( $assoc_args['force'] );
         $full     = isset( $assoc_args['full'] );
         $all_open = isset( $assoc_args['all-open'] );
+
+        // Slow down API requests during sync to avoid rate limits
+        Missive::setThrottleDelay( 1.0 );
+
+        // Parse --start-before to seed the initial pagination cursor
+        $start_before = null;
+        if ( ! empty( $assoc_args['start-before'] ) ) {
+            $start_before = strtotime( $assoc_args['start-before'] );
+            if ( $start_before === false ) {
+                \WP_CLI::error( "Could not parse --start-before value: {$assoc_args['start-before']}" );
+            }
+        }
 
         if ( $all_open ) {
             $since = 0;
@@ -120,6 +136,10 @@ class Commands {
             $scope = $full ? 'open + closed' : 'open';
             \WP_CLI::log( "Syncing $scope conversations from the last $human_duration" . ( $force ? ' (force refresh)' : '' ) . "..." );
             \WP_CLI::log( "Cutoff: " . date( 'Y-m-d H:i:s', $since ) );
+        }
+
+        if ( $start_before ) {
+            \WP_CLI::log( "Starting from: " . date( 'Y-m-d H:i:s', $start_before ) . " (skipping newer conversations)" );
         }
 
         $db = $this->getDb();
@@ -139,7 +159,7 @@ class Commands {
             // Always sync open conversations
             \WP_CLI::log( "Fetching $inbox_label (open)..." );
             try {
-                list( $ids, $msg_count ) = $this->syncInbox( $inbox_params, $since, $force );
+                list( $ids, $msg_count ) = $this->syncInbox( $inbox_params, $since, $force, 'open', $start_before );
                 $synced_ids = array_merge( $synced_ids, $ids );
                 $total_messages += $msg_count;
             } catch ( \Exception $e ) {
@@ -154,7 +174,7 @@ class Commands {
 
                 \WP_CLI::log( "Fetching $inbox_label (closed)..." );
                 try {
-                    list( $ids, $msg_count ) = $this->syncInbox( $closed_params, $since, $force, 'closed' );
+                    list( $ids, $msg_count ) = $this->syncInbox( $closed_params, $since, $force, 'closed', $start_before );
                     $synced_ids = array_merge( $synced_ids, $ids );
                     $total_messages += $msg_count;
                 } catch ( \Exception $e ) {
@@ -163,28 +183,25 @@ class Commands {
             }
         }
 
-        // Mark conversations not in synced list as closed
-        $synced_ids = array_unique( $synced_ids );
-        $closed_count = $db->markClosedExcept( $synced_ids );
-
         \WP_CLI::success( sprintf(
-            "Synced %d conversations (%d messages). Marked %d as closed.",
-            count( $synced_ids ),
-            $total_messages,
-            $closed_count
+            "Synced %d conversations (%d messages).",
+            count( array_unique( $synced_ids ) ),
+            $total_messages
         ) );
     }
 
     /**
      * Sync an inbox and return list of synced conversation IDs
      */
-    private function syncInbox( array $options, int $since, bool $force = false, string $status = 'open' ): array {
+    private function syncInbox( array $options, int $since, bool $force = false, string $status = 'open', ?int $start_before = null ): array {
         $db = $this->getDb();
         $synced_ids = [];
         $messages_synced = 0;
-        $until = null;
+        $until = $start_before;
+        $page = 0;
 
         do {
+            $page++;
             $params = array_merge( $options, [ 'limit' => 50 ] );
             if ( $until ) {
                 $params['until'] = $until;
@@ -192,6 +209,12 @@ class Commands {
 
             $response = Missive::get( '/conversations', $params );
             $conversations = $response['conversations'] ?? [];
+
+            if ( ! empty( $conversations ) ) {
+                $oldest_activity = end( $conversations )['last_activity_at'] ?? null;
+                $oldest_date = $oldest_activity ? date( 'Y-m-d H:i', (int) $oldest_activity ) : '?';
+                \WP_CLI::log( "  Page $page: " . count( $conversations ) . " conversations (back to $oldest_date)" );
+            }
 
             if ( empty( $conversations ) ) {
                 break;
@@ -213,7 +236,11 @@ class Commands {
                 $needs_sync = $force || $db->needsMessageSync( $conv['id'], $activity_time );
 
                 // Always update conversation metadata
-                $db->upsertConversation( $conv, $status );
+                $previous_status = $db->upsertConversation( $conv, $status );
+                if ( $previous_status !== null ) {
+                    $subject = $conv['subject'] ?? $conv['latest_message_subject'] ?? substr( $conv['id'], 0, 8 );
+                    \WP_CLI::log( "  Status changed: $subject ($previous_status -> $status)" );
+                }
 
                 if ( $needs_sync ) {
                     try {
@@ -514,14 +541,32 @@ class Commands {
      * [--status=<status>]
      * : Filter by status (open or closed)
      *
+     * [--messages=<count>]
+     * : Filter by message count (e.g., 1, 1-3, 4+)
+     *
      * [--unclassified]
      * : Show only unclassified conversations
      *
      * [--preview]
      * : Show a preview snippet of the latest message
      *
+     * [--order=<order>]
+     * : Sort order by last activity (asc or desc)
+     * ---
+     * default: desc
+     * options:
+     *   - asc
+     *   - desc
+     * ---
+     *
+     * [--after=<date>]
+     * : Only show conversations with activity after this date (YYYY-MM-DD)
+     *
+     * [--before=<date>]
+     * : Only show conversations with activity before this date (YYYY-MM-DD)
+     *
      * [--format=<format>]
-     * : Output format (table or ids)
+     * : Output format (table, ids, or count)
      * ---
      * default: table
      * ---
@@ -534,6 +579,11 @@ class Commands {
      *     wp missive list --subject="Site Removal" --status=open
      *     wp missive list --subject="Injection detected" --format=ids
      *     wp missive list --unclassified
+     *     wp missive list --messages=1 --status=open
+     *     wp missive list --messages=1-3
+     *     wp missive list --messages=4+
+     *     wp missive list --status=open --after=2026-03-01
+     *     wp missive list --status=open --after=2026-03-01 --format=count
      *
      * @when after_wp_load
      */
@@ -552,17 +602,53 @@ class Commands {
             $filters['status'] = $assoc_args['status'];
         }
 
-        $filters['limit'] = (int) ( $assoc_args['limit'] ?? 50 );
+        if ( isset( $assoc_args['messages'] ) ) {
+            $msg_filter = $assoc_args['messages'];
+            if ( preg_match( '/^(\d+)$/', $msg_filter, $m ) ) {
+                // Exact: --messages=1
+                $filters['messages_min'] = (int) $m[1];
+                $filters['messages_max'] = (int) $m[1];
+            } elseif ( preg_match( '/^(\d+)-(\d+)$/', $msg_filter, $m ) ) {
+                // Range: --messages=1-3
+                $filters['messages_min'] = (int) $m[1];
+                $filters['messages_max'] = (int) $m[2];
+            } elseif ( preg_match( '/^(\d+)\+$/', $msg_filter, $m ) ) {
+                // Minimum: --messages=4+
+                $filters['messages_min'] = (int) $m[1];
+            }
+        }
+
+        if ( isset( $assoc_args['after'] ) ) {
+            $filters['since'] = strtotime( $assoc_args['after'] . ' 00:00:00' );
+        }
+
+        if ( isset( $assoc_args['before'] ) ) {
+            $filters['before'] = strtotime( $assoc_args['before'] . ' 23:59:59' );
+        }
+
+        $format = $assoc_args['format'] ?? 'table';
+        $filters['limit'] = $format === 'count' ? null : (int) ( $assoc_args['limit'] ?? 50 );
+
+        if ( isset( $assoc_args['order'] ) ) {
+            $filters['order'] = strtolower( $assoc_args['order'] ) === 'asc' ? 'ASC' : 'DESC';
+        }
 
         $db = $this->getDb();
         $conversations = $db->getConversations( $filters );
 
         if ( empty( $conversations ) ) {
+            if ( $format === 'count' ) {
+                echo "0\n";
+                return;
+            }
             \WP_CLI::log( "No conversations found." );
             return;
         }
 
-        $format = $assoc_args['format'] ?? 'table';
+        if ( $format === 'count' ) {
+            \WP_CLI::log( count( $conversations ) );
+            return;
+        }
 
         if ( $format === 'ids' ) {
             foreach ( $conversations as $conv ) {
@@ -572,6 +658,7 @@ class Commands {
         }
 
         $show_preview = isset( $assoc_args['preview'] );
+        $truncate = $format === 'table';
 
         $rows = [];
         foreach ( $conversations as $conv ) {
@@ -585,28 +672,29 @@ class Commands {
             $subject = $conv['subject'] ?: $conv['message_subject'] ?? '(no subject)';
 
             $row = [
-                'ID'         => substr( $conv['id'], 0, 8 ) . '...',
-                'Subject'    => mb_substr( $subject, 0, 50 ),
-                'From'       => mb_substr( $author_str, 0, 25 ),
+                'ID'         => $truncate ? substr( $conv['id'], 0, 8 ) . '...' : $conv['id'],
+                'Subject'    => $truncate ? mb_substr( $subject, 0, 50 ) : $subject,
+                'From'       => $truncate ? mb_substr( $author_str, 0, 25 ) : $author_str,
                 'Activity'   => date( 'Y-m-d H:i', $conv['last_activity_at'] ),
+                'Msgs'       => $conv['messages_count'] ?? 0,
                 'Status'     => $conv['status'] ?? 'open',
                 'Classified' => $conv['has_classification'] > 0 ? 'Yes' : 'No',
             ];
 
             if ( $show_preview ) {
                 $preview = $conv['latest_preview'] ?? '';
-                $row['Preview'] = mb_substr( $preview, 0, 80 );
+                $row['Preview'] = $truncate ? mb_substr( $preview, 0, 80 ) : $preview;
             }
 
             $rows[] = $row;
         }
 
-        $columns = [ 'ID', 'Subject', 'From', 'Activity', 'Status', 'Classified' ];
+        $columns = [ 'ID', 'Subject', 'From', 'Activity', 'Msgs', 'Status', 'Classified' ];
         if ( $show_preview ) {
             $columns[] = 'Preview';
         }
 
-        \WP_CLI\Utils\format_items( 'table', $rows, $columns );
+        \WP_CLI\Utils\format_items( $format, $rows, $columns );
     }
 
     /**
@@ -614,8 +702,8 @@ class Commands {
      *
      * ## OPTIONS
      *
-     * <id>
-     * : Conversation ID (supports partial matching)
+     * <id>...
+     * : One or more conversation IDs (supports partial matching)
      *
      * [--full]
      * : Show full message bodies without truncation
@@ -635,53 +723,71 @@ class Commands {
      * ## EXAMPLES
      *
      *     wp missive show abc123
+     *     wp missive show abc123 def456 ghi789
      *     wp missive show abc123 --full
      *     wp missive show abc123 --pretty
      *     wp missive show abc123 --links
      *     wp missive show abc123 --format=json
+     *     wp missive search "Injection" --format=ids | xargs wp missive show --pretty
      *
      * @when after_wp_load
      */
     public function show( $args, $assoc_args ) {
-        if ( empty( $args[0] ) ) {
-            \WP_CLI::error( "Usage: wp missive show <conversation_id>" );
+        if ( empty( $args ) ) {
+            \WP_CLI::error( "Usage: wp missive show <conversation_id> [<conversation_id>...]" );
         }
 
-        $id = $args[0];
-        $db = $this->getDb();
+        $db     = $this->getDb();
+        $format = $assoc_args['format'] ?? 'text';
+        $pretty = isset( $assoc_args['pretty'] );
+        $full   = isset( $assoc_args['full'] ) || $format === 'json' || $pretty;
+        $links  = isset( $assoc_args['links'] );
 
-        // Support partial ID matching
-        if ( strlen( $id ) < 36 ) {
-            $full_id = $db->findByPartialId( $id );
-            if ( $full_id ) {
-                $id = $full_id;
+        // Resolve all IDs upfront
+        $conversations = [];
+        $not_found     = [];
+        foreach ( $args as $input_id ) {
+            $id = $input_id;
+            if ( strlen( $id ) < 36 ) {
+                $full_id = $db->findByPartialId( $id );
+                if ( $full_id ) {
+                    $id = $full_id;
+                }
+            }
+            $conv = $db->getConversation( $id );
+            if ( $conv ) {
+                $conversations[] = $conv;
+            } else {
+                $not_found[] = $input_id;
             }
         }
 
-        $conv = $db->getConversation( $id );
-
-        if ( ! $conv ) {
-            \WP_CLI::error( "Conversation not found: $id" );
+        if ( ! empty( $not_found ) ) {
+            foreach ( $not_found as $nf ) {
+                \WP_CLI::warning( "Conversation not found: $nf" );
+            }
         }
 
-        $format = $assoc_args['format'] ?? 'text';
-        $pretty = isset( $assoc_args['pretty'] );
-        $full = isset( $assoc_args['full'] ) || $format === 'json' || $pretty;
+        if ( empty( $conversations ) ) {
+            \WP_CLI::error( "No conversations found." );
+        }
 
         // Links extraction mode
-        if ( isset( $assoc_args['links'] ) ) {
+        if ( $links ) {
             $urls = [];
-            foreach ( $conv['messages'] as $msg ) {
-                if ( ! empty( $msg['body'] ) ) {
-                    // Extract href URLs from anchor tags
-                    preg_match_all( '/<a[^>]*href=["\']([^"\']+)["\'][^>]*>/i', $msg['body'], $matches );
-                    if ( ! empty( $matches[1] ) ) {
-                        $urls = array_merge( $urls, $matches[1] );
-                    }
-                    // Extract bare URLs not in tags
-                    preg_match_all( '/(?<!href=["\'])(https?:\/\/[^\s<>"\']+)/i', $msg['body'], $bare );
-                    if ( ! empty( $bare[1] ) ) {
-                        $urls = array_merge( $urls, $bare[1] );
+            foreach ( $conversations as $conv ) {
+                foreach ( $conv['messages'] as $msg ) {
+                    if ( ! empty( $msg['body'] ) ) {
+                        // Extract href URLs from anchor tags
+                        preg_match_all( '/<a[^>]*href=["\']([^"\']+)["\'][^>]*>/i', $msg['body'], $matches );
+                        if ( ! empty( $matches[1] ) ) {
+                            $urls = array_merge( $urls, $matches[1] );
+                        }
+                        // Extract bare URLs not in tags
+                        preg_match_all( '/(?<!href=["\'])(https?:\/\/[^\s<>"\']+)/i', $msg['body'], $bare );
+                        if ( ! empty( $bare[1] ) ) {
+                            $urls = array_merge( $urls, $bare[1] );
+                        }
                     }
                 }
             }
@@ -702,87 +808,107 @@ class Commands {
 
         // JSON output
         if ( $format === 'json' ) {
-            $output = [
-                'id'              => $conv['id'],
-                'subject'         => $conv['subject'] ?? null,
-                'web_url'         => $conv['web_url'] ?? null,
-                'status'          => $conv['status'] ?? 'open',
-                'last_activity_at' => $conv['last_activity_at'],
-                'authors'         => json_decode( $conv['authors'], true ) ?: [],
-                'classification'  => $conv['classification'],
-                'messages'        => array_map( function( $msg ) {
-                    return [
-                        'id'           => $msg['id'],
-                        'from_name'    => $msg['from_name'] ?? null,
-                        'from_address' => $msg['from_address'] ?? null,
-                        'to_fields'    => json_decode( $msg['to_fields'], true ) ?: [],
-                        'subject'      => $msg['subject'] ?? null,
-                        'preview'      => $msg['preview'] ?? null,
-                        'body'         => $msg['body'] ?? null,
-                        'delivered_at' => $msg['delivered_at'],
-                    ];
-                }, $conv['messages'] ),
-            ];
+            $output = array_map( function( $conv ) {
+                return [
+                    'id'              => $conv['id'],
+                    'subject'         => $conv['subject'] ?? null,
+                    'web_url'         => $conv['web_url'] ?? null,
+                    'status'          => $conv['status'] ?? 'open',
+                    'last_activity_at' => $conv['last_activity_at'],
+                    'authors'         => json_decode( $conv['authors'], true ) ?: [],
+                    'classification'  => $conv['classification'],
+                    'messages'        => array_map( function( $msg ) {
+                        return [
+                            'id'           => $msg['id'],
+                            'from_name'    => $msg['from_name'] ?? null,
+                            'from_address' => $msg['from_address'] ?? null,
+                            'to_fields'    => json_decode( $msg['to_fields'], true ) ?: [],
+                            'cc_fields'    => json_decode( $msg['cc_fields'] ?? '', true ) ?: [],
+                            'bcc_fields'   => json_decode( $msg['bcc_fields'] ?? '', true ) ?: [],
+                            'reply_to_fields' => json_decode( $msg['reply_to_fields'] ?? '', true ) ?: [],
+                            'subject'      => $msg['subject'] ?? null,
+                            'preview'      => $msg['preview'] ?? null,
+                            'body'         => $msg['body'] ?? null,
+                            'delivered_at' => $msg['delivered_at'],
+                        ];
+                    }, $conv['messages'] ),
+                ];
+            }, $conversations );
+            // Single ID: output object directly for backwards compatibility
+            if ( count( $output ) === 1 ) {
+                $output = $output[0];
+            }
             echo json_encode( $output, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) . "\n";
             return;
         }
 
         // Pretty TUI output
         if ( $pretty ) {
-            $this->showPretty( $conv );
+            foreach ( $conversations as $conv ) {
+                $this->showPretty( $conv );
+            }
             return;
         }
 
         // Text output
-        \WP_CLI::log( "=== Conversation ===" );
-        \WP_CLI::log( "ID: " . $conv['id'] );
-        \WP_CLI::log( "Subject: " . ( $conv['subject'] ?? '(no subject)' ) );
-        \WP_CLI::log( "URL: " . ( $conv['web_url'] ?? 'N/A' ) );
-        \WP_CLI::log( "Status: " . ( $conv['status'] ?? 'open' ) );
-        \WP_CLI::log( "Last Activity: " . date( 'Y-m-d H:i:s', $conv['last_activity_at'] ) );
-
-        $authors = json_decode( $conv['authors'], true ) ?: [];
-        if ( ! empty( $authors ) ) {
-            \WP_CLI::log( "Authors:" );
-            foreach ( $authors as $author ) {
-                $name = $author['name'] ?? '';
-                $addr = $author['address'] ?? '';
-                \WP_CLI::log( "  - $name <$addr>" );
+        foreach ( $conversations as $ci => $conv ) {
+            if ( $ci > 0 ) {
+                \WP_CLI::log( "" );
             }
-        }
+            \WP_CLI::log( "=== Conversation ===" );
+            \WP_CLI::log( "ID: " . $conv['id'] );
+            \WP_CLI::log( "Subject: " . ( $conv['subject'] ?? '(no subject)' ) );
+            \WP_CLI::log( "URL: " . ( $conv['web_url'] ?? 'N/A' ) );
+            \WP_CLI::log( "Status: " . ( $conv['status'] ?? 'open' ) );
+            \WP_CLI::log( "Last Activity: " . date( 'Y-m-d H:i:s', $conv['last_activity_at'] ) );
 
-        if ( $conv['classification'] ) {
-            \WP_CLI::log( "\n=== Classification ===" );
-            \WP_CLI::log( "Priority: " . $conv['classification']['priority'] );
-            \WP_CLI::log( "Category: " . $conv['classification']['category'] );
-            if ( $conv['classification']['reasoning'] ) {
-                \WP_CLI::log( "Reasoning: " . $conv['classification']['reasoning'] );
-            }
-            if ( $conv['classification']['suggested_action'] ) {
-                \WP_CLI::log( "Suggested Action: " . $conv['classification']['suggested_action'] );
-            }
-        }
-
-        \WP_CLI::log( "\n=== Messages (" . count( $conv['messages'] ) . ") ===" );
-        foreach ( $conv['messages'] as $i => $msg ) {
-            \WP_CLI::log( "\n--- Message " . ( $i + 1 ) . " ---" );
-            \WP_CLI::log( "From: " . ( $msg['from_name'] ?? '' ) . " <" . ( $msg['from_address'] ?? '' ) . ">" );
-            \WP_CLI::log( "Date: " . ( $msg['delivered_at'] ? date( 'Y-m-d H:i:s', $msg['delivered_at'] ) : 'N/A' ) );
-            \WP_CLI::log( "Subject: " . ( $msg['subject'] ?? '(no subject)' ) );
-
-            if ( $msg['preview'] ) {
-                \WP_CLI::log( "Preview: " . $msg['preview'] );
-            }
-
-            if ( $msg['body'] ) {
-                $body = strip_tags( $msg['body'] );
-                $body = html_entity_decode( $body );
-                $body = preg_replace( '/\s+/', ' ', $body );
-                $body = trim( $body );
-                if ( ! $full && strlen( $body ) > 500 ) {
-                    $body = substr( $body, 0, 500 ) . '...';
+            $authors = json_decode( $conv['authors'], true ) ?: [];
+            if ( ! empty( $authors ) ) {
+                \WP_CLI::log( "Authors:" );
+                foreach ( $authors as $author ) {
+                    $name = $author['name'] ?? '';
+                    $addr = $author['address'] ?? '';
+                    \WP_CLI::log( "  - $name <$addr>" );
                 }
-                \WP_CLI::log( "Body:\n" . $body );
+            }
+
+            if ( $conv['classification'] ) {
+                \WP_CLI::log( "\n=== Classification ===" );
+                \WP_CLI::log( "Priority: " . $conv['classification']['priority'] );
+                \WP_CLI::log( "Category: " . $conv['classification']['category'] );
+                if ( $conv['classification']['reasoning'] ) {
+                    \WP_CLI::log( "Reasoning: " . $conv['classification']['reasoning'] );
+                }
+                if ( $conv['classification']['suggested_action'] ) {
+                    \WP_CLI::log( "Suggested Action: " . $conv['classification']['suggested_action'] );
+                }
+            }
+
+            \WP_CLI::log( "\n=== Messages (" . count( $conv['messages'] ) . ") ===" );
+            foreach ( $conv['messages'] as $i => $msg ) {
+                \WP_CLI::log( "\n--- Message " . ( $i + 1 ) . " ---" );
+                \WP_CLI::log( "From: " . ( $msg['from_name'] ?? '' ) . " <" . ( $msg['from_address'] ?? '' ) . ">" );
+                $cc_str = $this->formatFieldList( $msg['cc_fields'] ?? null );
+                if ( $cc_str !== '' ) {
+                    \WP_CLI::log( "Cc: " . $cc_str );
+                }
+                \WP_CLI::log( "Date: " . ( $msg['delivered_at'] ? date( 'Y-m-d H:i:s', $msg['delivered_at'] ) : 'N/A' ) );
+                \WP_CLI::log( "Subject: " . ( $msg['subject'] ?? '(no subject)' ) );
+
+                if ( $msg['preview'] ) {
+                    \WP_CLI::log( "Preview: " . $msg['preview'] );
+                }
+
+                if ( $msg['body'] ) {
+                    $body = strip_tags( $msg['body'] );
+                    $body = html_entity_decode( $body );
+                    $body = preg_replace( '/\s+/', ' ', $body );
+                    $body = trim( $body );
+                    if ( ! $full && strlen( $body ) > 500 ) {
+                        $body = substr( $body, 0, 500 ) . '...';
+                    }
+                    \WP_CLI::log( "Body:\n" . $body );
+                }
             }
         }
     }
@@ -849,6 +975,12 @@ class Commands {
                     $to_parts[] = $to['name'] ?? $to['address'] ?? '';
                 }
                 echo "  {$dim}To: " . implode( ', ', $to_parts ) . $reset . "\n";
+            }
+
+            // Cc fields
+            $cc_str = $this->formatFieldList( $msg['cc_fields'] ?? null );
+            if ( $cc_str !== '' ) {
+                echo "  {$dim}Cc: " . $cc_str . $reset . "\n";
             }
 
             echo "\n";
@@ -963,12 +1095,154 @@ class Commands {
     }
 
     /**
+     * Format an array (or JSON string) of {name, address} fields into a
+     * human-readable "Name <addr>, ..." string. Returns '' when empty.
+     */
+    private function formatFieldList( $value ): string {
+        if ( is_string( $value ) ) {
+            $value = json_decode( $value, true ) ?: [];
+        }
+        if ( ! is_array( $value ) || empty( $value ) ) {
+            return '';
+        }
+
+        $parts = [];
+        foreach ( $value as $field ) {
+            $name = $field['name'] ?? '';
+            $addr = $field['address'] ?? '';
+            if ( $addr === '' ) {
+                continue;
+            }
+            $parts[] = ( $name && $name !== $addr ) ? "$name <$addr>" : $addr;
+        }
+
+        return implode( ', ', $parts );
+    }
+
+    /**
+     * Remove duplicate recipients by address (case-insensitive), optionally
+     * excluding a set of addresses (e.g. addresses already present in To).
+     */
+    private function dedupeFields( array $fields, array $exclude_addresses = [] ): array {
+        $seen = array_map( 'strtolower', $exclude_addresses );
+        $out  = [];
+
+        foreach ( $fields as $field ) {
+            $addr = strtolower( $field['address'] ?? '' );
+            if ( $addr === '' || in_array( $addr, $seen, true ) ) {
+                continue;
+            }
+            $seen[] = $addr;
+            $out[]  = $field;
+        }
+
+        return $out;
+    }
+
+    /**
+     * The current user's own email addresses, used to exclude self when
+     * building reply-all recipients. Seeded from the --from address and the
+     * optional MISSIVE_MY_ADDRESSES constant/env (comma-separated).
+     */
+    private function myAddresses( string $from_address ): array {
+        $addresses = [];
+        if ( $from_address !== '' ) {
+            $addresses[] = strtolower( $from_address );
+        }
+
+        $extra = null;
+        if ( defined( 'MISSIVE_MY_ADDRESSES' ) && MISSIVE_MY_ADDRESSES ) {
+            $extra = MISSIVE_MY_ADDRESSES;
+        } else {
+            $env = getenv( 'MISSIVE_MY_ADDRESSES' );
+            if ( $env ) {
+                $extra = $env;
+            }
+        }
+        if ( $extra ) {
+            foreach ( explode( ',', $extra ) as $addr ) {
+                $addr = strtolower( trim( $addr ) );
+                if ( $addr !== '' ) {
+                    $addresses[] = $addr;
+                }
+            }
+        }
+
+        return array_values( array_unique( $addresses ) );
+    }
+
+    /**
+     * Build reply-all To/Cc lists from the latest inbound message in a
+     * conversation. Replies to the most recent message not sent by the current
+     * user (falling back to the most recent message). The original sender plus
+     * its To recipients become To; its Cc recipients become Cc. The current
+     * user's own addresses are excluded throughout.
+     *
+     * @return array{to: array, cc: array}
+     */
+    private function buildReplyAllRecipients( string $conv_id, string $from_address ): array {
+        $response = Missive::get( "/conversations/{$conv_id}/messages" );
+        $messages = $response['messages'] ?? [];
+
+        if ( empty( $messages ) ) {
+            \WP_CLI::error( "No messages found in conversation to reply to." );
+        }
+
+        $mine = $this->myAddresses( $from_address );
+
+        // Messages are newest-first; prefer the most recent one not from me.
+        $target = null;
+        foreach ( $messages as $message ) {
+            $addr = strtolower( $message['from_field']['address'] ?? '' );
+            if ( $addr !== '' && ! in_array( $addr, $mine, true ) ) {
+                $target = $message;
+                break;
+            }
+        }
+        if ( $target === null ) {
+            $target = $messages[0];
+        }
+
+        $to   = [];
+        $cc   = [];
+        $seen = $mine;
+
+        $add = function( array $field, array &$bucket ) use ( &$seen ) {
+            $addr = strtolower( $field['address'] ?? '' );
+            if ( $addr === '' || in_array( $addr, $seen, true ) ) {
+                return;
+            }
+            $seen[]  = $addr;
+            $entry   = [ 'address' => $field['address'] ];
+            if ( ! empty( $field['name'] ) ) {
+                $entry['name'] = $field['name'];
+            }
+            $bucket[] = $entry;
+        };
+
+        if ( ! empty( $target['from_field'] ) ) {
+            $add( $target['from_field'], $to );
+        }
+        foreach ( $target['to_fields'] ?? [] as $field ) {
+            $add( $field, $to );
+        }
+        foreach ( $target['cc_fields'] ?? [] as $field ) {
+            $add( $field, $cc );
+        }
+
+        return [ 'to' => $to, 'cc' => $cc ];
+    }
+
+    /**
      * Create an email draft in Missive
      *
      * ## OPTIONS
      *
-     * --to=<email>
-     * : Recipient email address (e.g., "user@example.com" or "Name <user@example.com>")
+     * [--to=<email>]
+     * : Recipient email address(es), comma-separated (e.g., "user@example.com" or "Name <user@example.com>"). Required unless --reply-all is used.
+     *
+     * [--reply-all]
+     * : Auto-populate To and Cc from the latest inbound message in the conversation (requires --conversation). Your own address (--from and MISSIVE_MY_ADDRESSES) is excluded. Explicit --to/--cc still take precedence/merge.
      *
      * [--subject=<subject>]
      * : Email subject line (required for new conversations)
@@ -1008,14 +1282,12 @@ class Commands {
      *     # Send immediately
      *     wp missive draft --to="user@example.com" --subject="Urgent" --body="Message" --send
      *
+     *     # Reply-all on a conversation (To/Cc auto-filled from the latest inbound message)
+     *     wp missive draft --reply-all --conversation=abc123 --from="austin@anchor.host" --body="Thanks!"
+     *
      * @when after_wp_load
      */
     public function draft( $args, $assoc_args ) {
-        // Validate --to is provided
-        if ( empty( $assoc_args['to'] ) ) {
-            \WP_CLI::error( "The --to parameter is required." );
-        }
-
         // Get body from --body or --body-file
         if ( isset( $assoc_args['body'] ) ) {
             $body = $assoc_args['body'];
@@ -1032,9 +1304,54 @@ class Commands {
             \WP_CLI::error( "Must provide --body or --body-file" );
         }
 
+        // Resolve sender (used to exclude self from reply-all recipients)
+        $from_field   = isset( $assoc_args['from'] ) ? $this->parseEmailAddress( $assoc_args['from'] ) : null;
+        $from_address = $from_field['address'] ?? '';
+
+        // Resolve conversation ID early (needed for reply-all), with partial matching
+        $conv_id = null;
+        if ( isset( $assoc_args['conversation'] ) ) {
+            $conv_id = $assoc_args['conversation'];
+            if ( strlen( $conv_id ) < 36 ) {
+                $full_id = $this->getDb()->findByPartialId( $conv_id );
+                if ( $full_id ) {
+                    $conv_id = $full_id;
+                }
+            }
+        }
+
+        // Reply-all: derive To/Cc from the latest inbound message in the thread
+        $reply_to = [];
+        $reply_cc = [];
+        if ( isset( $assoc_args['reply-all'] ) ) {
+            if ( ! $conv_id ) {
+                \WP_CLI::error( "--reply-all requires --conversation." );
+            }
+            $recipients = $this->buildReplyAllRecipients( $conv_id, $from_address );
+            $reply_to = $recipients['to'];
+            $reply_cc = $recipients['cc'];
+        }
+
+        // Build recipient lists: explicit flags take precedence, then reply-all defaults
+        $to_fields = ! empty( $assoc_args['to'] ) ? $this->parseEmailList( $assoc_args['to'] ) : $reply_to;
+
+        if ( empty( $to_fields ) ) {
+            \WP_CLI::error( "The --to parameter is required (or use --reply-all on a conversation that has recipients)." );
+        }
+
+        $cc_fields = $reply_cc;
+        if ( isset( $assoc_args['cc'] ) ) {
+            $cc_fields = array_merge( $cc_fields, $this->parseEmailList( $assoc_args['cc'] ) );
+        }
+
+        // Dedupe: unique To, and Cc minus anyone already in To
+        $to_fields    = $this->dedupeFields( $to_fields );
+        $to_addresses = array_map( fn( $f ) => strtolower( $f['address'] ?? '' ), $to_fields );
+        $cc_fields    = $this->dedupeFields( $cc_fields, $to_addresses );
+
         // Build draft payload
         $draft = [
-            'to_fields' => [ $this->parseEmailAddress( $assoc_args['to'] ) ],
+            'to_fields' => $to_fields,
             'body'      => $body,
         ];
 
@@ -1044,13 +1361,13 @@ class Commands {
         }
 
         // Optional from
-        if ( isset( $assoc_args['from'] ) ) {
-            $draft['from_field'] = $this->parseEmailAddress( $assoc_args['from'] );
+        if ( $from_field ) {
+            $draft['from_field'] = $from_field;
         }
 
-        // Optional CC
-        if ( isset( $assoc_args['cc'] ) ) {
-            $draft['cc_fields'] = $this->parseEmailList( $assoc_args['cc'] );
+        // CC (explicit and/or reply-all)
+        if ( ! empty( $cc_fields ) ) {
+            $draft['cc_fields'] = $cc_fields;
         }
 
         // Optional BCC
@@ -1058,25 +1375,22 @@ class Commands {
             $draft['bcc_fields'] = $this->parseEmailList( $assoc_args['bcc'] );
         }
 
-        // Optional conversation ID (with partial matching support)
-        if ( isset( $assoc_args['conversation'] ) ) {
-            $conv_id = $assoc_args['conversation'];
-
-            // Support partial ID matching
-            if ( strlen( $conv_id ) < 36 ) {
-                $db = $this->getDb();
-                $full_id = $db->findByPartialId( $conv_id );
-                if ( $full_id ) {
-                    $conv_id = $full_id;
-                }
-            }
-
+        // Optional conversation
+        if ( $conv_id ) {
             $draft['conversation'] = $conv_id;
         }
 
         // Optional send flag
         if ( isset( $assoc_args['send'] ) ) {
             $draft['send'] = true;
+        }
+
+        // Surface resolved recipients when reply-all filled them in
+        if ( isset( $assoc_args['reply-all'] ) ) {
+            \WP_CLI::log( "Reply-all To: " . $this->formatFieldList( $to_fields ) );
+            if ( ! empty( $cc_fields ) ) {
+                \WP_CLI::log( "Reply-all Cc: " . $this->formatFieldList( $cc_fields ) );
+            }
         }
 
         $payload = [ 'drafts' => $draft ];
@@ -1205,10 +1519,14 @@ class Commands {
      * [--username=<username>]
      * : Display name for the close action (defaults to MISSIVE_API_NAME constant)
      *
+     * [--local]
+     * : Only close in the local database, skip the Missive API
+     *
      * ## EXAMPLES
      *
      *     wp missive close 32891480
      *     wp missive close 32891480 68c15b55
+     *     wp missive close --local 32891480
      *     wp missive search "Injection" --format=ids | xargs wp missive close
      *
      * @when after_wp_load
@@ -1225,66 +1543,76 @@ class Commands {
         }
 
         $db = $this->getDb();
-        $closed = 0;
-        $failed = 0;
-        $total  = count( $args );
-        $quiet  = $total > 10;
+        $total = count( $args );
+        $quiet = $total > 10;
 
+        // Resolve all IDs first
+        $ids = [];
+        $not_found = 0;
         foreach ( $args as $input_id ) {
             $id = $input_id;
-
-            // Support partial ID matching
             if ( strlen( $id ) < 36 ) {
                 $full_id = $db->findByPartialId( $id );
                 if ( $full_id ) {
                     $id = $full_id;
                 } else {
                     \WP_CLI::warning( "Conversation not found: $input_id" );
+                    $not_found++;
+                    continue;
+                }
+            }
+            $ids[] = $id;
+        }
+
+        if ( empty( $ids ) ) {
+            \WP_CLI::error( "No valid conversations to close." );
+        }
+
+        $local_only = isset( $assoc_args['local'] );
+        $username = $assoc_args['username'] ?? ( defined( 'MISSIVE_API_NAME' ) ? MISSIVE_API_NAME : 'Missive CLI' );
+        $closed = 0;
+        $failed = 0;
+
+        foreach ( $ids as $id ) {
+            // Close via Missive API unless --local flag is set
+            if ( ! $local_only ) {
+                try {
+                    Missive::post( '/posts', [
+                        'posts' => [
+                            'conversation'  => $id,
+                            'close'         => true,
+                            'reopen'        => false,
+                            'notification'  => [ 'title' => 'Closed', 'body' => 'Conversation closed' ],
+                            'markdown'      => 'Conversation closed.',
+                            'username'      => $username,
+                        ],
+                    ] );
+                } catch ( \Exception $e ) {
+                    \WP_CLI::warning( "API error closing $id: " . $e->getMessage() );
                     $failed++;
                     continue;
                 }
             }
 
-            try {
-                Missive::post( '/posts', [
-                    'posts' => [
-                        'conversation' => $id,
-                        'close'        => true,
-                        'text'         => 'Conversation closed via CLI.',
-                        'notification' => [
-                            'title' => 'Conversation closed',
-                            'body'  => 'Closed via CLI',
-                        ],
-                        'username'     => $assoc_args['username'] ?? ( defined( 'MISSIVE_API_NAME' ) ? MISSIVE_API_NAME : 'Missive CLI' ),
-                    ],
-                ] );
-            } catch ( \Exception $e ) {
-                \WP_CLI::warning( "API error closing $input_id: " . $e->getMessage() );
-                $failed++;
-                continue;
-            }
-
             // Update local database
             $db->closeConversation( $id );
+            $closed++;
 
-            $conv = $db->getConversation( $id );
-            $subject = $conv['subject'] ?? '(no subject)';
-
-            if ( $quiet ) {
-                $closed++;
-            } else {
-                \WP_CLI::success( "Closed: $subject ($input_id)" );
-                $closed++;
+            if ( ! $quiet ) {
+                $conv = $db->getConversation( $id );
+                $subject = $conv['subject'] ?? '(no subject)';
+                \WP_CLI::success( "Closed: $subject ($id)" );
             }
         }
 
-        if ( $quiet ) {
-            $msg = "Closed $closed conversation" . ( $closed !== 1 ? 's' : '' );
-            if ( $failed > 0 ) {
-                $msg .= " ($failed failed)";
-            }
-            \WP_CLI::success( $msg . '.' );
+        $msg = "Closed $closed conversation" . ( $closed !== 1 ? 's' : '' );
+        if ( $failed > 0 ) {
+            $msg .= " ($failed failed)";
         }
+        if ( $not_found > 0 ) {
+            $msg .= " ($not_found not found)";
+        }
+        \WP_CLI::success( $msg . '.' );
     }
 
     /**
