@@ -29,8 +29,16 @@ class Database {
 
     public function __construct( ?string $db_path = null ) {
         $this->db_path = $db_path ?? ABSPATH . '../private/missive.db';
+        $dir = dirname( $this->db_path );
+        if ( ! is_dir( $dir ) ) {
+            mkdir( $dir, 0700, true );
+        }
+        $new_db = ! file_exists( $this->db_path );
         $this->db = new \PDO( "sqlite:{$this->db_path}" );
         $this->db->setAttribute( \PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION );
+        if ( $new_db ) {
+            chmod( $this->db_path, 0600 );
+        }
         $this->initSchema();
     }
 
@@ -72,6 +80,9 @@ class Database {
                 from_name TEXT,
                 from_address TEXT,
                 to_fields TEXT,
+                cc_fields TEXT,
+                bcc_fields TEXT,
+                reply_to_fields TEXT,
                 delivered_at INTEGER,
                 synced_at INTEGER,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id)
@@ -113,12 +124,33 @@ class Database {
             $this->db->exec( "ALTER TABLE conversations ADD COLUMN status TEXT DEFAULT 'open'" );
             $this->db->exec( "UPDATE conversations SET status = 'open' WHERE status IS NULL" );
         }
+
+        // Add recipient-header columns to the messages table for existing databases.
+        $message_tables = $this->db->query( "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'" )->fetchAll();
+        if ( ! empty( $message_tables ) ) {
+            $msg_columns = $this->db->query( "PRAGMA table_info(messages)" )->fetchAll( \PDO::FETCH_ASSOC );
+            $msg_column_names = array_column( $msg_columns, 'name' );
+            foreach ( [ 'cc_fields', 'bcc_fields', 'reply_to_fields' ] as $column ) {
+                if ( ! in_array( $column, $msg_column_names ) ) {
+                    $this->db->exec( "ALTER TABLE messages ADD COLUMN {$column} TEXT" );
+                }
+            }
+        }
     }
 
     /**
      * Upsert a conversation
      */
-    public function upsertConversation( array $conv, string $status = 'open' ): void {
+    public function upsertConversation( array $conv, string $status = 'open' ): ?string {
+        // Check if status is changing
+        $previous_status = null;
+        $check = $this->db->prepare( "SELECT status FROM conversations WHERE id = ?" );
+        $check->execute( [ $conv['id'] ] );
+        $row = $check->fetch( \PDO::FETCH_ASSOC );
+        if ( $row && $row['status'] !== $status ) {
+            $previous_status = $row['status'];
+        }
+
         $stmt = $this->db->prepare( "
             INSERT OR REPLACE INTO conversations
             (id, subject, last_activity_at, authors, assignees, shared_labels, web_url, messages_count, created_at, synced_at, status)
@@ -138,30 +170,8 @@ class Database {
             time(),
             $status,
         ] );
-    }
 
-    /**
-     * Mark conversations as closed if not in the given list of IDs
-     */
-    public function markClosedExcept( array $open_ids ): int {
-        if ( empty( $open_ids ) ) {
-            $stmt = $this->db->prepare( "UPDATE conversations SET status = 'closed' WHERE status = 'open'" );
-            $stmt->execute();
-            return $stmt->rowCount();
-        }
-
-        // Use a temp table approach to avoid SQLite placeholder limits
-        $this->db->exec( "CREATE TEMP TABLE IF NOT EXISTS temp_open_ids (id TEXT PRIMARY KEY)" );
-        $this->db->exec( "DELETE FROM temp_open_ids" );
-
-        $insert = $this->db->prepare( "INSERT OR IGNORE INTO temp_open_ids (id) VALUES (?)" );
-        foreach ( $open_ids as $id ) {
-            $insert->execute( [ $id ] );
-        }
-
-        $stmt = $this->db->prepare( "UPDATE conversations SET status = 'closed' WHERE status = 'open' AND id NOT IN (SELECT id FROM temp_open_ids)" );
-        $stmt->execute();
-        return $stmt->rowCount();
+        return $previous_status;
     }
 
     /**
@@ -170,6 +180,33 @@ class Database {
     public function closeConversation( string $id ): bool {
         $stmt = $this->db->prepare( "UPDATE conversations SET status = 'closed' WHERE id = ?" );
         return $stmt->execute( [ $id ] ) && $stmt->rowCount() > 0;
+    }
+
+    /**
+     * Batch-load messages for a set of conversations
+     */
+    private function loadMessagesForConversations( array &$conversations ): void {
+        if ( empty( $conversations ) ) {
+            return;
+        }
+
+        $ids = array_column( $conversations, 'id' );
+        $placeholders = implode( ',', array_fill( 0, count( $ids ), '?' ) );
+
+        $stmt = $this->db->prepare(
+            "SELECT * FROM messages WHERE conversation_id IN ($placeholders) ORDER BY delivered_at ASC"
+        );
+        $stmt->execute( $ids );
+        $all_messages = $stmt->fetchAll( \PDO::FETCH_ASSOC );
+
+        $grouped = [];
+        foreach ( $all_messages as $msg ) {
+            $grouped[ $msg['conversation_id'] ][] = $msg;
+        }
+
+        foreach ( $conversations as &$conv ) {
+            $conv['messages'] = $grouped[ $conv['id'] ] ?? [];
+        }
     }
 
     /**
@@ -190,11 +227,7 @@ class Database {
         $stmt->execute( $params );
         $conversations = $stmt->fetchAll( \PDO::FETCH_ASSOC );
 
-        foreach ( $conversations as &$conv ) {
-            $stmt = $this->db->prepare( "SELECT * FROM messages WHERE conversation_id = ? ORDER BY delivered_at ASC" );
-            $stmt->execute( [ $conv['id'] ] );
-            $conv['messages'] = $stmt->fetchAll( \PDO::FETCH_ASSOC );
-        }
+        $this->loadMessagesForConversations( $conversations );
 
         return $conversations;
     }
@@ -220,8 +253,8 @@ class Database {
     public function upsertMessage( array $msg, string $conversation_id ): void {
         $stmt = $this->db->prepare( "
             INSERT OR REPLACE INTO messages
-            (id, conversation_id, subject, preview, body, from_name, from_address, to_fields, delivered_at, synced_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, conversation_id, subject, preview, body, from_name, from_address, to_fields, cc_fields, bcc_fields, reply_to_fields, delivered_at, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         " );
 
         $from = $msg['from_field'] ?? [];
@@ -235,6 +268,9 @@ class Database {
             $from['name'] ?? null,
             $from['address'] ?? null,
             json_encode( $msg['to_fields'] ?? [] ),
+            json_encode( $msg['cc_fields'] ?? [] ),
+            json_encode( $msg['bcc_fields'] ?? [] ),
+            json_encode( $msg['reply_to_fields'] ?? [] ),
             self::parseTimestamp( $msg['delivered_at'] ?? null ),
             time(),
         ] );
@@ -266,6 +302,11 @@ class Database {
             $params[] = $filters['since'];
         }
 
+        if ( isset( $filters['before'] ) ) {
+            $where[] = "c.last_activity_at <= ?";
+            $params[] = $filters['before'];
+        }
+
         if ( isset( $filters['subject'] ) ) {
             $where[] = "c.subject LIKE ?";
             $params[] = '%' . $filters['subject'] . '%';
@@ -276,13 +317,24 @@ class Database {
             $params[] = $filters['status'];
         }
 
+        if ( isset( $filters['messages_max'] ) ) {
+            $where[] = "c.messages_count <= ?";
+            $params[] = (int) $filters['messages_max'];
+        }
+
+        if ( isset( $filters['messages_min'] ) ) {
+            $where[] = "c.messages_count >= ?";
+            $params[] = (int) $filters['messages_min'];
+        }
+
         if ( ! empty( $where ) ) {
             $sql .= " WHERE " . implode( " AND ", $where );
         }
 
-        $sql .= " ORDER BY c.last_activity_at DESC";
+        $order = ( isset( $filters['order'] ) && $filters['order'] === 'ASC' ) ? 'ASC' : 'DESC';
+        $sql .= " ORDER BY c.last_activity_at $order";
 
-        if ( isset( $filters['limit'] ) ) {
+        if ( ! empty( $filters['limit'] ) ) {
             $sql .= " LIMIT " . (int) $filters['limit'];
         }
 
@@ -327,12 +379,7 @@ class Database {
         $stmt = $this->db->query( $sql );
         $conversations = $stmt->fetchAll( \PDO::FETCH_ASSOC );
 
-        // Fetch messages for each conversation
-        foreach ( $conversations as &$conv ) {
-            $stmt = $this->db->prepare( "SELECT * FROM messages WHERE conversation_id = ? ORDER BY delivered_at ASC" );
-            $stmt->execute( [ $conv['id'] ] );
-            $conv['messages'] = $stmt->fetchAll( \PDO::FETCH_ASSOC );
-        }
+        $this->loadMessagesForConversations( $conversations );
 
         return $conversations;
     }
