@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Missive CLI
  * Description: WP-CLI commands for syncing and managing Missive inbox conversations
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: Austin Ginder
  * Author URI: https://github.com/austinginder/missive-cli/
  * Requires PHP: 8.0

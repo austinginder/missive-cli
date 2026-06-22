@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.1.0 — 2026-06-22
+
+### New
+
+- **CC / BCC / Reply-To capture** — `sync` now stores the `cc_fields`, `bcc_fields`, and `reply_to_fields` of every message, and `show` displays the Cc line in text, pretty, and JSON output. Existing databases migrate automatically.
+- **`draft --reply-all`** — auto-fills To and Cc from the latest inbound message in a conversation (original sender + To recipients become To, original Cc becomes Cc). Excludes your own addresses (`--from` plus the optional `MISSIVE_MY_ADDRESSES` constant/env) and de-duplicates. `--to` is now optional when `--reply-all` is used. Explicit `--to`/`--cc` still take precedence and merge.
+- **`sync --start-before=<datetime>`** — seed the pagination cursor to backfill older history instead of starting from now.
+- **Team inbox + status tracking** — `sync` also syncs the team inbox when `MISSIVE_TEAM_ID` is set, tracks open/closed status transitions, and syncs closed conversations with `--full`.
+- **`close --local`** — close a conversation only in the local database, skipping the Missive API.
+- **`list` filters** — `--messages=<count>`, `--order=<asc|desc>`, `--after=<date>`, and `--before=<date>`, plus a Status column.
+
+### Improved
+
+- **Rate-limit handling** — the API client retries on HTTP 429 with `Retry-After`/exponential backoff and throttles requests during bulk syncs.
+- **Database storage** — the private database directory is created automatically with secure (`0700`/`0600`) permissions.
+
 ## v1.0.0 — 2026-03-28
 
 Initial release.
