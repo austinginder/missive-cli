@@ -165,17 +165,26 @@ class Missive {
     }
 
     /**
+     * Set the minimum delay between API requests in seconds.
+     * Higher values reduce rate limit hits during bulk operations.
+     */
+    private static float $throttle_delay = 0.25;
+
+    public static function setThrottleDelay( float $seconds ): void {
+        self::$throttle_delay = max( 0.1, $seconds );
+    }
+
+    /**
      * Executes a request callback with retry on 429 rate limits.
      * Uses Retry-After header when available, falls back to exponential backoff.
-     * Adds a small delay between all requests to stay under 5 req/sec.
+     * Adds a configurable delay between all requests.
      */
     private static function request_with_retry( callable $request_fn, int $max_retries = 5 ) {
-        // Proactive throttle: wait 250ms between requests to stay under 5/sec
         static $last_request_time = 0;
         $now = microtime( true );
         $elapsed = $now - $last_request_time;
-        if ( $last_request_time > 0 && $elapsed < 0.25 ) {
-            usleep( (int) ( ( 0.25 - $elapsed ) * 1_000_000 ) );
+        if ( $last_request_time > 0 && $elapsed < self::$throttle_delay ) {
+            usleep( (int) ( ( self::$throttle_delay - $elapsed ) * 1_000_000 ) );
         }
         $last_request_time = microtime( true );
 
