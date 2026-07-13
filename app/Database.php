@@ -233,10 +233,14 @@ class Database {
     }
 
     /**
-     * Check if conversation needs message sync (new or updated)
+     * Check if conversation needs message sync (new, updated, incomplete bodies, or count mismatch)
+     *
+     * @param string   $id               Conversation ID
+     * @param int      $last_activity_at Remote last_activity_at (unix)
+     * @param int|null $messages_count   Remote messages_count when known
      */
-    public function needsMessageSync( string $id, int $last_activity_at ): bool {
-        $stmt = $this->db->prepare( "SELECT last_activity_at FROM conversations WHERE id = ?" );
+    public function needsMessageSync( string $id, int $last_activity_at, ?int $messages_count = null ): bool {
+        $stmt = $this->db->prepare( "SELECT last_activity_at, messages_count FROM conversations WHERE id = ?" );
         $stmt->execute( [ $id ] );
         $row = $stmt->fetch( \PDO::FETCH_ASSOC );
 
@@ -244,7 +248,63 @@ class Database {
             return true; // New conversation
         }
 
-        return $row['last_activity_at'] < $last_activity_at;
+        if ( (int) $row['last_activity_at'] < $last_activity_at ) {
+            return true; // Newer activity on the remote side
+        }
+
+        // Remote message count drifted from what we stored on the conversation row.
+        if ( $messages_count !== null && (int) $row['messages_count'] !== $messages_count ) {
+            return true;
+        }
+
+        // Local message rows missing or incomplete (empty body) — the Jami-class bug.
+        $count_stmt = $this->db->prepare( "SELECT COUNT(*) AS c, SUM(CASE WHEN body IS NULL OR body = '' THEN 1 ELSE 0 END) AS empty_bodies FROM messages WHERE conversation_id = ?" );
+        $count_stmt->execute( [ $id ] );
+        $counts = $count_stmt->fetch( \PDO::FETCH_ASSOC );
+        $local_count  = (int) ( $counts['c'] ?? 0 );
+        $empty_bodies = (int) ( $counts['empty_bodies'] ?? 0 );
+
+        if ( $local_count === 0 ) {
+            return true;
+        }
+
+        if ( $messages_count !== null && $local_count < $messages_count ) {
+            return true;
+        }
+
+        if ( $empty_bodies > 0 ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Message IDs in a conversation with empty/null bodies.
+     *
+     * @return array<string,true>
+     */
+    public function getEmptyBodyMessageIds( string $conversation_id ): array {
+        $stmt = $this->db->prepare( "SELECT id FROM messages WHERE conversation_id = ? AND (body IS NULL OR body = '')" );
+        $stmt->execute( [ $conversation_id ] );
+        $ids = [];
+        foreach ( $stmt->fetchAll( \PDO::FETCH_ASSOC ) as $row ) {
+            $ids[ $row['id'] ] = true;
+        }
+        return $ids;
+    }
+
+    /**
+     * Return a stored message body, or null if missing.
+     */
+    public function getMessageBody( string $message_id ): ?string {
+        $stmt = $this->db->prepare( "SELECT body FROM messages WHERE id = ?" );
+        $stmt->execute( [ $message_id ] );
+        $row = $stmt->fetch( \PDO::FETCH_ASSOC );
+        if ( ! $row ) {
+            return null;
+        }
+        return $row['body'];
     }
 
     /**
