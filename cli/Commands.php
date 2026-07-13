@@ -92,7 +92,13 @@ class Commands {
      * : Sync both open and closed conversations (default: open only)
      *
      * [--force]
-     * : Re-fetch all message bodies even if unchanged
+     * : Re-check every conversation in range even if last_activity_at is unchanged
+     *
+     * [--force-bodies]
+     * : Re-download full message bodies even when a local body already exists
+     *
+     * [--conversation=<id>]
+     * : Sync only this conversation (partial ID OK). Ignores timeframe/inbox paging.
      *
      * [--start-before=<datetime>]
      * : Start syncing from this point instead of now (e.g., 2025-01-15, "2025-01-15 08:00:00")
@@ -104,18 +110,27 @@ class Commands {
      *     wp missive sync --timeframe=7d --full
      *     wp missive sync --timeframe=12h --force
      *     wp missive sync --all-open
+     *     wp missive sync --conversation=eab2e106
      *     wp missive sync --timeframe=10y --start-before="2024-06-01"
      *
      * @when after_wp_load
      */
     public function sync( $args, $assoc_args ) {
-        $timeframe = $assoc_args['timeframe'] ?? '1w';
-        $force    = isset( $assoc_args['force'] );
-        $full     = isset( $assoc_args['full'] );
-        $all_open = isset( $assoc_args['all-open'] );
+        $timeframe    = $assoc_args['timeframe'] ?? '1w';
+        $force        = isset( $assoc_args['force'] );
+        $force_bodies = isset( $assoc_args['force-bodies'] );
+        $full         = isset( $assoc_args['full'] );
+        $all_open     = isset( $assoc_args['all-open'] );
 
-        // Slow down API requests during sync to avoid rate limits
-        Missive::setThrottleDelay( 1.0 );
+        // Adaptive throttle: start fast (~0.2s), only slow down on 429.
+        Missive::setAdaptiveThrottle( true );
+        Missive::setThrottleDelay( 0.2 );
+
+        // Surgical single-conversation sync (no inbox pagination).
+        if ( ! empty( $assoc_args['conversation'] ) ) {
+            $this->syncSingleConversation( $assoc_args['conversation'], $force_bodies || $force );
+            return;
+        }
 
         // Parse --start-before to seed the initial pagination cursor
         $start_before = null;
@@ -126,15 +141,24 @@ class Commands {
             }
         }
 
+        $flags = [];
+        if ( $force ) {
+            $flags[] = 'force';
+        }
+        if ( $force_bodies ) {
+            $flags[] = 'force-bodies';
+        }
+        $flag_note = $flags ? ' (' . implode( ', ', $flags ) . ')' : '';
+
         if ( $all_open ) {
             $since = 0;
-            \WP_CLI::log( "Syncing all open conversations" . ( $force ? ' (force refresh)' : '' ) . "..." );
+            \WP_CLI::log( "Syncing all open conversations{$flag_note}..." );
         } else {
             $duration_seconds = $this->parseDuration( $timeframe );
             $since = time() - $duration_seconds;
             $human_duration = $this->formatDuration( $duration_seconds );
             $scope = $full ? 'open + closed' : 'open';
-            \WP_CLI::log( "Syncing $scope conversations from the last $human_duration" . ( $force ? ' (force refresh)' : '' ) . "..." );
+            \WP_CLI::log( "Syncing $scope conversations from the last $human_duration{$flag_note}..." );
             \WP_CLI::log( "Cutoff: " . date( 'Y-m-d H:i:s', $since ) );
         }
 
@@ -159,7 +183,7 @@ class Commands {
             // Always sync open conversations
             \WP_CLI::log( "Fetching $inbox_label (open)..." );
             try {
-                list( $ids, $msg_count ) = $this->syncInbox( $inbox_params, $since, $force, 'open', $start_before );
+                list( $ids, $msg_count ) = $this->syncInbox( $inbox_params, $since, $force, $force_bodies, 'open', $start_before );
                 $synced_ids = array_merge( $synced_ids, $ids );
                 $total_messages += $msg_count;
             } catch ( \Exception $e ) {
@@ -174,7 +198,7 @@ class Commands {
 
                 \WP_CLI::log( "Fetching $inbox_label (closed)..." );
                 try {
-                    list( $ids, $msg_count ) = $this->syncInbox( $closed_params, $since, $force, 'closed', $start_before );
+                    list( $ids, $msg_count ) = $this->syncInbox( $closed_params, $since, $force, $force_bodies, 'closed', $start_before );
                     $synced_ids = array_merge( $synced_ids, $ids );
                     $total_messages += $msg_count;
                 } catch ( \Exception $e ) {
@@ -184,16 +208,58 @@ class Commands {
         }
 
         \WP_CLI::success( sprintf(
-            "Synced %d conversations (%d messages).",
+            "Synced %d conversations (%d messages). Final throttle: %ss",
             count( array_unique( $synced_ids ) ),
-            $total_messages
+            $total_messages,
+            round( Missive::getThrottleDelay(), 2 )
         ) );
+    }
+
+    /**
+     * Sync a single conversation by full or partial ID.
+     */
+    private function syncSingleConversation( string $partial_id, bool $force_bodies = false ): void {
+        $db = $this->getDb();
+
+        // Prefer resolving via local DB partial match when possible.
+        $conv_id = $db->findByPartialId( $partial_id ) ?: $partial_id;
+
+        \WP_CLI::log( "Syncing conversation $conv_id..." );
+
+        try {
+            $response = Missive::get( "/conversations/{$conv_id}" );
+            $list     = $response['conversations'] ?? [];
+            $conv     = $list[0] ?? null;
+            if ( ! $conv || empty( $conv['id'] ) ) {
+                // Try partial search against local open list as a last resort message.
+                \WP_CLI::error( "Conversation not found via API: $partial_id" );
+            }
+            $conv_id = $conv['id'];
+        } catch ( \Exception $e ) {
+            \WP_CLI::error( "Could not fetch conversation: " . $e->getMessage() );
+        }
+
+        $status = ! empty( $conv['closed_at'] ) ? 'closed' : 'open';
+        $previous_status = $db->upsertConversation( $conv, $status );
+        if ( $previous_status !== null ) {
+            $subject = $conv['subject'] ?? $conv['latest_message_subject'] ?? substr( $conv['id'], 0, 8 );
+            \WP_CLI::log( "  Status changed: $subject ($previous_status -> $status)" );
+        }
+
+        try {
+            $msg_count = $this->syncConversationMessages( $conv, $force_bodies );
+        } catch ( \Exception $e ) {
+            \WP_CLI::error( "Could not fetch messages: " . $e->getMessage() );
+        }
+
+        $display = $conv['subject'] ?? $conv['latest_message_subject'] ?? $conv_id;
+        \WP_CLI::success( "Synced $display ($msg_count messages)." );
     }
 
     /**
      * Sync an inbox and return list of synced conversation IDs
      */
-    private function syncInbox( array $options, int $since, bool $force = false, string $status = 'open', ?int $start_before = null ): array {
+    private function syncInbox( array $options, int $since, bool $force = false, bool $force_bodies = false, string $status = 'open', ?int $start_before = null ): array {
         $db = $this->getDb();
         $synced_ids = [];
         $messages_synced = 0;
@@ -230,10 +296,10 @@ class Commands {
                 }
 
                 $synced_ids[] = $conv['id'];
-                $messages = [];
+                $remote_count = isset( $conv['messages_count'] ) ? (int) $conv['messages_count'] : null;
 
-                // Check if conversation has new activity (or force refresh)
-                $needs_sync = $force || $db->needsMessageSync( $conv['id'], $activity_time );
+                // New activity, incomplete local bodies/count, or --force.
+                $needs_sync = $force || $db->needsMessageSync( $conv['id'], $activity_time, $remote_count );
 
                 // Always update conversation metadata
                 $previous_status = $db->upsertConversation( $conv, $status );
@@ -244,65 +310,14 @@ class Commands {
 
                 if ( $needs_sync ) {
                     try {
-                        $msg_response = Missive::get( "/conversations/{$conv['id']}/messages" );
-                        $messages = $msg_response['messages'] ?? [];
-
-                        // Collect message IDs that need full body fetch
-                        $ids_to_fetch = [];
-                        foreach ( $messages as $msg ) {
-                            if ( ( $force || empty( $msg['body'] ) ) && ! empty( $msg['id'] ) ) {
-                                $ids_to_fetch[] = $msg['id'];
-                            }
-                        }
-
-                        // Batch fetch full messages (up to 50 per request)
-                        $full_messages = [];
-                        foreach ( array_chunk( $ids_to_fetch, 50 ) as $batch ) {
-                            try {
-                                $batch_response = Missive::get( "/messages/" . implode( ',', $batch ) );
-                                $fetched = $batch_response['messages'] ?? [];
-                                // Single message returns object, batch returns array
-                                if ( ! empty( $fetched ) && ! isset( $fetched[0] ) ) {
-                                    $fetched = [ $fetched ];
-                                }
-                                foreach ( $fetched as $full_msg ) {
-                                    if ( ! empty( $full_msg['id'] ) ) {
-                                        $full_messages[ $full_msg['id'] ] = $full_msg;
-                                    }
-                                }
-                            } catch ( \Exception $e ) {
-                                \WP_CLI::warning( "Batch fetch failed, falling back to individual: " . $e->getMessage() );
-                                foreach ( $batch as $msg_id ) {
-                                    try {
-                                        $full_msg = Missive::get( "/messages/{$msg_id}" );
-                                        $single = $full_msg['messages'] ?? $full_msg['message'] ?? $full_msg;
-                                        if ( ! empty( $single ) && ! isset( $single[0] ) && ! empty( $single['id'] ) ) {
-                                            $full_messages[ $single['id'] ] = $single;
-                                        }
-                                    } catch ( \Exception $e2 ) {
-                                        \WP_CLI::warning( "Could not fetch message {$msg_id}: " . $e2->getMessage() );
-                                    }
-                                }
-                            }
-                        }
-
-                        // Merge full bodies and upsert all messages
-                        foreach ( $messages as $msg ) {
-                            if ( ! empty( $msg['id'] ) && isset( $full_messages[ $msg['id'] ] ) ) {
-                                $msg = array_merge( $msg, $full_messages[ $msg['id'] ] );
-                            }
-                            $db->upsertMessage( $msg, $conv['id'] );
-                            $messages_synced++;
-                        }
+                        $msg_count = $this->syncConversationMessages( $conv, $force_bodies );
+                        $messages_synced += $msg_count;
                     } catch ( \Exception $e ) {
                         \WP_CLI::warning( "Could not fetch messages for {$conv['id']}: " . $e->getMessage() );
                     }
 
                     // Build display: subject or first author
-                    $display = $conv['subject'] ?? '';
-                    if ( ! $display && ! empty( $messages ) ) {
-                        $display = $messages[0]['subject'] ?? '';
-                    }
+                    $display = $conv['subject'] ?? $conv['latest_message_subject'] ?? '';
                     if ( ! $display ) {
                         $authors = $conv['authors'] ?? [];
                         if ( ! empty( $authors ) ) {
@@ -318,6 +333,117 @@ class Commands {
         } while ( ! empty( $conversations ) && count( $conversations ) >= 50 );
 
         return [ $synced_ids, $messages_synced ];
+    }
+
+    /**
+     * Fetch messages for one conversation, fill bodies, upsert. Returns messages upserted.
+     */
+    private function syncConversationMessages( array $conv, bool $force_bodies = false ): int {
+        $db = $this->getDb();
+        $conv_id = $conv['id'];
+
+        $msg_response = Missive::get( "/conversations/{$conv_id}/messages" );
+        $messages = $msg_response['messages'] ?? [];
+
+        // IDs needing a full body: missing body, or explicit --force-bodies.
+        // Also re-fetch when we already have a local row with empty body.
+        $local_empty = $this->localEmptyBodyIds( $conv_id );
+        $ids_to_fetch = [];
+        foreach ( $messages as $msg ) {
+            if ( empty( $msg['id'] ) ) {
+                continue;
+            }
+            $id = $msg['id'];
+            $remote_empty = empty( $msg['body'] );
+            if ( $force_bodies || $remote_empty || isset( $local_empty[ $id ] ) ) {
+                $ids_to_fetch[] = $id;
+            }
+        }
+        $ids_to_fetch = array_values( array_unique( $ids_to_fetch ) );
+
+        $full_messages = [];
+        // Prefer smaller batches (25) to reduce timeout fallbacks under load.
+        foreach ( array_chunk( $ids_to_fetch, 25 ) as $batch ) {
+            try {
+                $batch_response = Missive::get( "/messages/" . implode( ',', $batch ) );
+                $fetched = $batch_response['messages'] ?? [];
+                // Single message returns object, batch returns array
+                if ( ! empty( $fetched ) && ! isset( $fetched[0] ) ) {
+                    $fetched = [ $fetched ];
+                }
+                foreach ( $fetched as $full_msg ) {
+                    if ( ! empty( $full_msg['id'] ) ) {
+                        $full_messages[ $full_msg['id'] ] = $full_msg;
+                    }
+                }
+            } catch ( \Exception $e ) {
+                \WP_CLI::warning( "Batch fetch failed, retrying smaller then individual: " . $e->getMessage() );
+                // Second chance: half-size batches
+                foreach ( array_chunk( $batch, 10 ) as $small ) {
+                    try {
+                        $batch_response = Missive::get( "/messages/" . implode( ',', $small ) );
+                        $fetched = $batch_response['messages'] ?? [];
+                        if ( ! empty( $fetched ) && ! isset( $fetched[0] ) ) {
+                            $fetched = [ $fetched ];
+                        }
+                        foreach ( $fetched as $full_msg ) {
+                            if ( ! empty( $full_msg['id'] ) ) {
+                                $full_messages[ $full_msg['id'] ] = $full_msg;
+                            }
+                        }
+                        continue;
+                    } catch ( \Exception $e_small ) {
+                        // fall through to individual
+                    }
+                    foreach ( $small as $msg_id ) {
+                        try {
+                            $full_msg = Missive::get( "/messages/{$msg_id}" );
+                            $single = $full_msg['messages'] ?? $full_msg['message'] ?? $full_msg;
+                            if ( ! empty( $single ) && ! isset( $single[0] ) && ! empty( $single['id'] ) ) {
+                                $full_messages[ $single['id'] ] = $single;
+                            }
+                        } catch ( \Exception $e2 ) {
+                            \WP_CLI::warning( "Could not fetch message {$msg_id}: " . $e2->getMessage() );
+                        }
+                    }
+                }
+            }
+        }
+
+        $count = 0;
+        foreach ( $messages as $msg ) {
+            if ( ! empty( $msg['id'] ) && isset( $full_messages[ $msg['id'] ] ) ) {
+                $msg = array_merge( $msg, $full_messages[ $msg['id'] ] );
+            }
+            // Preserve an existing non-empty local body if remote list payload lacks one
+            // and we didn't re-fetch (avoids wiping bodies on partial list responses).
+            if ( empty( $msg['body'] ) && ! empty( $msg['id'] ) ) {
+                $existing = $this->getLocalMessageBody( $msg['id'] );
+                if ( $existing !== null && $existing !== '' ) {
+                    $msg['body'] = $existing;
+                }
+            }
+            $db->upsertMessage( $msg, $conv_id );
+            $count++;
+        }
+
+        return $count;
+    }
+
+    /**
+     * Map of message IDs in a conversation that have empty/null bodies locally.
+     *
+     * @return array<string,true>
+     */
+    private function localEmptyBodyIds( string $conversation_id ): array {
+        $db = $this->getDb();
+        // Access via a small query through Database would be cleaner; use PDO via reflection-free public helper if available.
+        // Fall back to show-style: re-query through a dedicated method.
+        return $db->getEmptyBodyMessageIds( $conversation_id );
+    }
+
+    private function getLocalMessageBody( string $message_id ): ?string {
+        return $this->getDb()->getMessageBody( $message_id );
     }
 
     /**
