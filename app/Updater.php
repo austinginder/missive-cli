@@ -10,7 +10,7 @@ class Updater {
 
     public function __construct() {
         $this->plugin_slug   = 'missive-cli';
-        $this->version       = '1.1.0';
+        $this->version       = '1.2.0';
         $this->cache_key     = 'missive_cli_updater';
         $this->cache_allowed = false;
 

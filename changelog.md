@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.2.0 — 2026-07-13
+
+### New
+
+- **`sync --conversation=<id>`** — sync a single conversation (partial ID OK) without paging the whole inbox. Use this to backfill incomplete threads instead of `--force` on the full inbox.
+- **`sync --force-bodies`** — re-download full message bodies even when a local body already exists. Separated from `--force` so a refresh no longer re-pulls every body by default.
+
+### Improved
+
+- **Faster sync throttle** — removed the hard 1.0s per-request delay. Adaptive throttle starts at ~0.2s, slows only after HTTP 429, and eases back toward 0.1s on success.
+- **Smarter incremental sync** — re-fetches when local bodies are empty, message counts drift, or remote activity is newer. Fixes incomplete threads (e.g. missing replies) without a full `--force` crawl.
+- **Resilient body batches** — prefer 25-message batches, then retry at 10 before falling back to individual GETs.
+
 ## v1.1.0 — 2026-06-22
 
 ### New
