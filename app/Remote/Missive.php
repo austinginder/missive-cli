@@ -165,13 +165,31 @@ class Missive {
     }
 
     /**
-     * Set the minimum delay between API requests in seconds.
+     * Adaptive inter-request throttle (seconds).
+     * Starts low and only slows after 429s; decays back toward $throttle_min on success.
+     */
+    private static float $throttle_delay = 0.2;
+    private static float $throttle_min   = 0.1;
+    private static float $throttle_max   = 2.0;
+    private static bool  $adaptive       = true;
+
+    /**
+     * Set the current delay between API requests in seconds.
      * Higher values reduce rate limit hits during bulk operations.
      */
-    private static float $throttle_delay = 0.25;
-
     public static function setThrottleDelay( float $seconds ): void {
-        self::$throttle_delay = max( 0.1, $seconds );
+        self::$throttle_delay = max( self::$throttle_min, min( self::$throttle_max, $seconds ) );
+    }
+
+    /**
+     * Enable/disable adaptive throttle (speed up after success, slow down on 429).
+     */
+    public static function setAdaptiveThrottle( bool $enabled ): void {
+        self::$adaptive = $enabled;
+    }
+
+    public static function getThrottleDelay(): float {
+        return self::$throttle_delay;
     }
 
     /**
@@ -198,6 +216,10 @@ class Missive {
             $http_code = wp_remote_retrieve_response_code( $remote );
 
             if ( $http_code !== 429 ) {
+                // On success, ease throttle back toward the floor.
+                if ( self::$adaptive && self::$throttle_delay > self::$throttle_min ) {
+                    self::$throttle_delay = max( self::$throttle_min, self::$throttle_delay * 0.92 );
+                }
                 return self::handle_response( $remote );
             }
 
@@ -210,9 +232,14 @@ class Missive {
             $wait = $retry_after ? (int) $retry_after : pow( 2, $attempt + 1 );
             $wait = max( $wait, 1 );
 
+            // Slow future requests after a rate limit.
+            if ( self::$adaptive ) {
+                self::$throttle_delay = min( self::$throttle_max, max( self::$throttle_delay * 2, (float) $wait ) );
+            }
+
             if ( defined( 'WP_CLI' ) && WP_CLI ) {
                 $source = $retry_after ? 'Retry-After' : 'backoff';
-                \WP_CLI::warning( "Rate limited (429). Waiting {$wait}s ({$source}) before retry " . ( $attempt + 1 ) . "/{$max_retries}..." );
+                \WP_CLI::warning( "Rate limited (429). Waiting {$wait}s ({$source}) before retry " . ( $attempt + 1 ) . "/{$max_retries}... (throttle now " . round( self::$throttle_delay, 2 ) . "s)" );
             }
             sleep( $wait );
             $last_request_time = microtime( true );
