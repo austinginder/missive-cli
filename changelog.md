@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.3.0 — 2026-08-05
+
+### New
+
+- **`draft --attach=<paths>`** — attach one or more files to a draft. Comma-separated paths with `~` expansion, base64 encoded for Missive's `POST /v1/drafts`. Missive's 25-file and 10 MB payload limits are enforced before the request goes out rather than after the upload, and each file is logged with its size as it is attached.
+
+### Fixed
+
+- **Stop re-closing conversations that are already closed live** — Missive's personal `inbox=true` feed can return conversations that already have `closed_at` set, so trusting the list name alone marked them open locally and `process-emails` kept re-closing them, each pass adding another "Conversation closed." comment. Status is now derived from the payload (`closed_at`, then `users[me].closed`) and `close` skips the API post when the conversation is already closed, updating only the local database.
+
+### Documentation
+
+- **Readme caught up with the last two releases** — documents `draft --reply-all` (shipped in 1.1.0), `sync --force-bodies` and `sync --conversation=<id>` (shipped in 1.2.0), and the new `draft --attach`, all of which were implemented but undocumented.
+
 ## v1.2.0 — 2026-07-13
 
 ### New
