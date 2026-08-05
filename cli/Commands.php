@@ -1421,6 +1421,12 @@ class Commands {
      * [--bcc=<emails>]
      * : BCC recipients (comma-separated)
      *
+     * [--attach=<paths>]
+     * : File(s) to attach, comma-separated paths. Missive allows up to 25 files
+     * and a 10 MB total request payload; files are base64 encoded, which inflates
+     * them by roughly a third, so the practical ceiling is about 7 MB of source
+     * files. Both limits are checked before the request is sent.
+     *
      * [--send]
      * : Send immediately instead of creating a draft
      *
@@ -1531,6 +1537,11 @@ class Commands {
             $draft['bcc_fields'] = $this->parseEmailList( $assoc_args['bcc'] );
         }
 
+        // Optional attachments
+        if ( isset( $assoc_args['attach'] ) ) {
+            $draft['attachments'] = $this->buildAttachments( $assoc_args['attach'] );
+        }
+
         // Optional conversation
         if ( $conv_id ) {
             $draft['conversation'] = $conv_id;
@@ -1566,6 +1577,76 @@ class Commands {
         } catch ( \Exception $e ) {
             \WP_CLI::error( "API error: " . $e->getMessage() );
         }
+    }
+
+    /**
+     * Builds the Missive attachments array from a comma-separated list of paths.
+     *
+     * Missive caps a draft at 25 files and a 10 MB total JSON payload. base64
+     * inflates by ~4/3, so both limits are enforced here rather than letting the
+     * API reject the request after the upload.
+     *
+     * @param string $spec Comma-separated file paths.
+     * @return array<int,array{base64_data:string,filename:string}>
+     */
+    private function buildAttachments( $spec ) {
+        // Budget slightly under Missive's 10 MB so the rest of the JSON fits.
+        $max_files   = 25;
+        $max_encoded = 9500000;
+
+        $paths = array_filter( array_map( 'trim', explode( ',', (string) $spec ) ), 'strlen' );
+
+        if ( empty( $paths ) ) {
+            \WP_CLI::error( "--attach was given but no file paths could be parsed." );
+        }
+
+        if ( count( $paths ) > $max_files ) {
+            \WP_CLI::error( sprintf( "Too many attachments: %d given, Missive allows %d.", count( $paths ), $max_files ) );
+        }
+
+        $attachments = [];
+        $total       = 0;
+
+        foreach ( $paths as $path ) {
+            $expanded = $path;
+            if ( strpos( $expanded, '~/' ) === 0 ) {
+                $home = getenv( 'HOME' );
+                if ( $home ) {
+                    $expanded = $home . substr( $expanded, 1 );
+                }
+            }
+
+            if ( ! file_exists( $expanded ) || ! is_file( $expanded ) ) {
+                \WP_CLI::error( "Attachment not found: $path" );
+            }
+            if ( ! is_readable( $expanded ) ) {
+                \WP_CLI::error( "Attachment is not readable: $path" );
+            }
+
+            $raw = file_get_contents( $expanded );
+            if ( $raw === false ) {
+                \WP_CLI::error( "Could not read attachment: $path" );
+            }
+
+            $encoded = base64_encode( $raw );
+            $total  += strlen( $encoded );
+
+            if ( $total > $max_encoded ) {
+                \WP_CLI::error( sprintf(
+                    "Attachments exceed Missive's 10 MB payload limit (%s encoded so far). Send fewer or smaller files.",
+                    size_format( $total )
+                ) );
+            }
+
+            $attachments[] = [
+                'base64_data' => $encoded,
+                'filename'    => basename( $expanded ),
+            ];
+
+            \WP_CLI::log( sprintf( "Attaching %s (%s)", basename( $expanded ), size_format( strlen( $raw ) ) ) );
+        }
+
+        return $attachments;
     }
 
     /**
