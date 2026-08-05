@@ -50,10 +50,14 @@ wp missive sync --timeframe=1d         # Last 24 hours
 wp missive sync --timeframe=7d         # Last 7 days
 wp missive sync --timeframe=7d --full  # Include closed conversations
 wp missive sync --all-open             # All open conversations regardless of age
-wp missive sync --force                # Re-fetch all message bodies
+wp missive sync --force                # Re-sync, including message bodies
+wp missive sync --force-bodies         # Re-download bodies even when one is stored
+wp missive sync --conversation=abc123  # Sync a single thread (partial ID OK)
 ```
 
 For daily use, `wp missive sync --timeframe=7d` keeps the database current. The sync is incremental and only fetches message bodies for conversations with new activity.
+
+To backfill one incomplete thread, reach for `--conversation=<id>` rather than `--force` on the whole inbox. It is deterministic and does not depend on the pagination cutoff.
 
 ### list
 
@@ -137,6 +141,21 @@ wp missive draft \
   --subject="Report" \
   --body-file=./email.html
 
+# Reply to everyone on the thread (To/Cc filled from the latest inbound message)
+wp missive draft \
+  --reply-all \
+  --conversation=abc123 \
+  --from="Your Name <you@example.com>" \
+  --subject="Re: Original subject" \
+  --body="Thanks all."
+
+# With attachments
+wp missive draft \
+  --to="Name <email@example.com>" \
+  --subject="Report" \
+  --body-file=./email.html \
+  --attach=./report.pdf,./data.csv
+
 # Send immediately
 wp missive draft \
   --to="Name <email@example.com>" \
@@ -147,13 +166,15 @@ wp missive draft \
 
 | Option | Required | Description |
 |--------|----------|-------------|
-| `--to` | Yes | Recipient (format: `email` or `Name <email>`) |
-| `--subject` | No* | Email subject (*required for new conversations) |
-| `--body` | Yes** | Email body (HTML or plain text) |
-| `--body-file` | Yes** | Path to file containing body (**alternative to `--body`) |
+| `--to` | Yes* | Recipient (format: `email` or `Name <email>`). *Not required with `--reply-all` |
+| `--reply-all` | No | Fill To/Cc from the latest inbound message (requires `--conversation`). Excludes your own addresses and de-dupes |
+| `--subject` | No** | Email subject (**required for new conversations) |
+| `--body` | Yes† | Email body (HTML or plain text) |
+| `--body-file` | Yes† | Path to file containing body (†alternative to `--body`) |
+| `--attach` | No | File(s) to attach, comma-separated paths. Max 25 files, ~7 MB of source files |
 | `--conversation` | No | Conversation ID to reply to (supports partial ID) |
 | `--from` | No | Sender email (must match a Missive alias) |
-| `--cc` | No | CC recipients (comma-separated) |
+| `--cc` | No | CC recipients (comma-separated, merges with `--reply-all`) |
 | `--bcc` | No | BCC recipients (comma-separated) |
 | `--send` | No | Send immediately instead of creating draft |
 
@@ -162,6 +183,7 @@ Tips for drafting:
 - **HTML formatting:** Use `<br>` for line breaks and `<br><br>` for paragraph spacing. Missive's editor collapses `<p>` tags into single line breaks.
 - **Replies need a subject:** The API does not auto-populate the subject on replies. Always include `--subject="Re: Original subject"`.
 - **Check reply-to:** For automated notification emails, the "from" address is often a no-reply. Check the conversation's `reply_to_fields` to find the correct recipient.
+- **Attachments:** Missive accepts up to 25 files and a 10 MB total request. Files are base64 encoded, which inflates them by roughly a third, so the practical ceiling is about 7 MB of source files. Both limits are checked before the request is sent, so an oversized batch fails fast rather than after the upload.
 
 ### close
 
