@@ -239,7 +239,7 @@ class Commands {
             \WP_CLI::error( "Could not fetch conversation: " . $e->getMessage() );
         }
 
-        $status = ! empty( $conv['closed_at'] ) ? 'closed' : 'open';
+        $status = $this->resolveConversationStatus( $conv, 'open' );
         $previous_status = $db->upsertConversation( $conv, $status );
         if ( $previous_status !== null ) {
             $subject = $conv['subject'] ?? $conv['latest_message_subject'] ?? substr( $conv['id'], 0, 8 );
@@ -254,6 +254,33 @@ class Commands {
 
         $display = $conv['subject'] ?? $conv['latest_message_subject'] ?? $conv_id;
         \WP_CLI::success( "Synced $display ($msg_count messages)." );
+    }
+
+    /**
+     * Resolve open/closed status from a Missive conversation payload.
+     *
+     * Prefer payload signals over which inbox list returned the row. Missive's
+     * personal `inbox=true` feed can include conversations that already have
+     * closed_at set (and users[me].closed = true) after a close post bumps
+     * last_activity — treating those as open reopens the local DB and causes
+     * process-emails to re-close them forever ("Conversation closed." spam).
+     *
+     * @param array  $conv        Conversation object from the Missive API.
+     * @param string $list_status Fallback from the list being synced ('open'|'closed').
+     */
+    private function resolveConversationStatus( array $conv, string $list_status = 'open' ): string {
+        if ( ! empty( $conv['closed_at'] ) ) {
+            return 'closed';
+        }
+
+        // Per-user closed for the authenticated account when the API marks "me".
+        foreach ( $conv['users'] ?? [] as $user ) {
+            if ( ! empty( $user['me'] ) && ! empty( $user['closed'] ) ) {
+                return 'closed';
+            }
+        }
+
+        return $list_status === 'closed' ? 'closed' : 'open';
     }
 
     /**
@@ -301,11 +328,14 @@ class Commands {
                 // New activity, incomplete local bodies/count, or --force.
                 $needs_sync = $force || $db->needsMessageSync( $conv['id'], $activity_time, $remote_count );
 
+                // Derive status from payload (closed_at / me.closed), not list name alone.
+                $resolved_status = $this->resolveConversationStatus( $conv, $status );
+
                 // Always update conversation metadata
-                $previous_status = $db->upsertConversation( $conv, $status );
+                $previous_status = $db->upsertConversation( $conv, $resolved_status );
                 if ( $previous_status !== null ) {
                     $subject = $conv['subject'] ?? $conv['latest_message_subject'] ?? substr( $conv['id'], 0, 8 );
-                    \WP_CLI::log( "  Status changed: $subject ($previous_status -> $status)" );
+                    \WP_CLI::log( "  Status changed: $subject ($previous_status -> $resolved_status)" );
                 }
 
                 if ( $needs_sync ) {
@@ -1697,12 +1727,41 @@ class Commands {
         $local_only = isset( $assoc_args['local'] );
         $username = $assoc_args['username'] ?? ( defined( 'MISSIVE_API_NAME' ) ? MISSIVE_API_NAME : 'Missive CLI' );
         $closed = 0;
+        $already_closed = 0;
         $failed = 0;
 
         foreach ( $ids as $id ) {
             // Close via Missive API unless --local flag is set
             if ( ! $local_only ) {
                 try {
+                    // Skip the close post when already closed live — re-posting
+                    // only adds "Conversation closed." noise and bumps last_activity,
+                    // which keeps ghosts in personal inbox=true and re-opens local status.
+                    $remote_closed = false;
+                    try {
+                        $response = Missive::get( "/conversations/{$id}" );
+                        $remote   = $response['conversations'][0] ?? null;
+                        if ( $remote && $this->resolveConversationStatus( $remote, 'open' ) === 'closed' ) {
+                            $remote_closed = true;
+                        }
+                    } catch ( \Exception $e ) {
+                        // Lookup failed — fall through to a normal close attempt.
+                        \WP_CLI::warning( "Could not pre-check status for $id: " . $e->getMessage() );
+                    }
+
+                    if ( $remote_closed ) {
+                        $db->closeConversation( $id );
+                        $already_closed++;
+                        $closed++;
+
+                        if ( ! $quiet ) {
+                            $conv = $db->getConversation( $id );
+                            $subject = $conv['subject'] ?? '(no subject)';
+                            \WP_CLI::success( "Already closed live (local only): $subject ($id)" );
+                        }
+                        continue;
+                    }
+
                     Missive::post( '/posts', [
                         'posts' => [
                             'conversation'  => $id,
@@ -1732,6 +1791,9 @@ class Commands {
         }
 
         $msg = "Closed $closed conversation" . ( $closed !== 1 ? 's' : '' );
+        if ( $already_closed > 0 ) {
+            $msg .= " ($already_closed already closed live — local only, no post)";
+        }
         if ( $failed > 0 ) {
             $msg .= " ($failed failed)";
         }
